@@ -12,8 +12,16 @@ We demonstrate that MXINT8/NVINT4 quantization formats are more accurate than th
 # Content of this code repo
 - `cal_qsnr.py`: calculate the QSNR of quantized models.
 - `cal_kl_ppl.py`: calculate the KL divergence and perplexity of quantized models.
+- `theoretical_comparisons.py`: compare the theoretical QSNR of integer and float-point quantization formats
 - `quant/quant_func.py`: fake quantization function of integer and float-point quantization
 - `quant/quant_linear.py`: linear layer with integer and float-point quantization
+
+
+# Theoretical Comparisons
+To compare the theoretical QSNR of integer and float-point quantization formats (eg. Figure 3 in our paper), you can run the following command:
+```
+python3 theoretical_comparisons.py
+```
 
 # Evaluate KL divergence and perplexity of quantized models
 We offer the scripts to evaluate the KL divergence and perplexity of quantized models across different low-bit formats. You can change `--model_path` to evaluate the KL divergence and perplexity of other models. You can also set `--rotate_dim 32` to introduce 32x32 random Hadamard rotation before quantization.
@@ -132,6 +140,8 @@ CUDA_VISIBLE_DEVICES=0 python3 cal_qsnr.py \
 --filename_prefix llama3.2_1b_base_nvfp4
 ```
 
+# Contact
+If you have any questions, please feel free to contact us at [chenmnz@connect.hku.hk](mailto: chenmnz@connect.hku.hk).
 
 # Citation
 ```
