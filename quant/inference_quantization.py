@@ -1,3 +1,4 @@
+import os
 import warnings
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, List, Optional
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 @dataclass
 class QuantConfig:
     enabled: bool = False
-    linear_quant_mode: str = "w_only"  # "w_only" or "wa"
+    linear_quant_mode: str = "w_only"  # "w_only", "wa", or "tiled_wa"
     replace_linear_modules: bool = False
     enable_attention_quant: bool = False  # placeholder for future attention path
 
@@ -46,6 +47,9 @@ class QuantConfig:
     act_scale_quant: bool = False
     act_scale_quant_2: bool = False
 
+    # Tiled W+A linear path params
+    n_tile: int = -1
+
     # Attention quant params
     attn_quant_mode: str = "qkv"  # "qkv", "qkvo", "full"
     attn_bit: int = 16
@@ -64,7 +68,7 @@ class QuantConfig:
         self.linear_quant_mode = str(self.linear_quant_mode).lower()
         if self.activation_enabled and self.linear_quant_mode == "w_only":
             self.linear_quant_mode = "wa"
-        if self.linear_quant_mode == "wa":
+        if self.linear_quant_mode in {"wa", "tiled_wa"}:
             self.replace_linear_modules = True
         self.attn_quant_mode = str(self.attn_quant_mode).lower()
 
@@ -81,20 +85,23 @@ class QuantConfig:
         return cls(**payload)
 
     def validate(self) -> None:
-        if self.linear_quant_mode not in {"w_only", "wa"}:
+        if self.linear_quant_mode not in {"w_only", "wa", "tiled_wa"}:
             raise ValueError(
-                f"linear_quant_mode must be 'w_only' or 'wa', got '{self.linear_quant_mode}'."
+                "linear_quant_mode must be 'w_only', 'wa', or 'tiled_wa', "
+                f"got '{self.linear_quant_mode}'."
             )
         if self.quant_type not in {"int", "fp"}:
             raise ValueError(
                 f"weight quant_type must be 'int' or 'fp', got '{self.quant_type}'."
             )
-        if self.linear_quant_mode == "wa" and self.quant_type != "int":
+        if self.linear_quant_mode in {"wa", "tiled_wa"} and self.quant_type != "int":
             raise NotImplementedError(
                 "Linear W+A quantization currently supports quant_type='int' only."
             )
-        if self.linear_quant_mode == "wa" and self.act_bit >= 16:
-            raise ValueError("linear_quant_mode='wa' requires act_bit < 16.")
+        if self.linear_quant_mode in {"wa", "tiled_wa"} and self.act_bit >= 16:
+            raise ValueError(
+                f"linear_quant_mode='{self.linear_quant_mode}' requires act_bit < 16."
+            )
         if self.bit < 2:
             raise ValueError(f"weight bit must be >= 2, got {self.bit}.")
         if self.w_group_size == 0:
@@ -111,7 +118,9 @@ class QuantConfig:
             raise ValueError("e8_scale and scale_quant cannot both be enabled.")
         if self.scale_quant and self.scale_quant_2:
             raise ValueError("scale_quant and scale_quant_2 cannot both be enabled.")
-        if self.activation_enabled and self.act_bit < 2:
+        if (
+            self.activation_enabled or self.linear_quant_mode in {"wa", "tiled_wa"}
+        ) and self.act_bit < 2:
             raise ValueError(f"activation act_bit must be >= 2, got {self.act_bit}.")
         if self.act_group_size == 0:
             raise ValueError("activation act_group_size must be -1 or > 0.")
@@ -130,6 +139,23 @@ class QuantConfig:
             raise ValueError(
                 "act_scale_quant and act_scale_quant_2 cannot both be enabled."
             )
+        if self.linear_quant_mode == "tiled_wa":
+            if self.w_group_size <= 0:
+                raise ValueError("linear_quant_mode='tiled_wa' requires w_group_size > 0.")
+            if self.act_group_size <= 0:
+                raise ValueError("linear_quant_mode='tiled_wa' requires act_group_size > 0.")
+            if int(self.w_group_size) != int(self.act_group_size):
+                raise ValueError(
+                    "linear_quant_mode='tiled_wa' requires w_group_size == act_group_size."
+                )
+            if int(self.n_tile) <= 0:
+                raise ValueError("linear_quant_mode='tiled_wa' requires n_tile > 0.")
+            if int(self.quant_dim) != -1:
+                raise ValueError("linear_quant_mode='tiled_wa' requires quant_dim == -1.")
+            if int(self.act_quant_dim) != -1:
+                raise ValueError(
+                    "linear_quant_mode='tiled_wa' requires act_quant_dim == -1."
+                )
         if self.attn_quant_mode not in {"qkv", "qkvo", "full"}:
             raise ValueError(
                 f"attn_quant_mode must be one of ['qkv', 'qkvo', 'full'], got '{self.attn_quant_mode}'."
@@ -286,6 +312,114 @@ def _quantize_activation_runtime(
     )
 
 
+def _detach_to_cpu(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _detach_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_to_cpu(item) for item in value)
+    return value
+
+
+class TiledWAProfiler:
+    def __init__(
+        self,
+        save_dir: str,
+        target_steps: Optional[List[int]] = None,
+        target_modules: Optional[List[str]] = None,
+        target_layer_indices: Optional[List[int]] = None,
+    ):
+        self.save_dir = save_dir
+        self.target_steps = set(target_steps) if target_steps is not None else None
+        self.target_modules = list(target_modules) if target_modules is not None else None
+        self.target_layer_indices = (
+            set(target_layer_indices) if target_layer_indices is not None else None
+        )
+        self.current_step = 0
+        self.buffer: Dict[str, List[Dict[str, Any]]] = {}
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def _should_capture_layer(self, name: str) -> bool:
+        if self.target_modules is not None and not any(
+            name == token or name.endswith(token) for token in self.target_modules
+        ):
+            return False
+        if self.target_layer_indices is None:
+            return True
+        parts = name.split(".")
+        for idx, part in enumerate(parts):
+            if part == "layers" and idx + 1 < len(parts):
+                try:
+                    layer_idx = int(parts[idx + 1])
+                except ValueError:
+                    continue
+                return layer_idx in self.target_layer_indices
+        return True
+
+    def should_capture(self, layer_name: str) -> bool:
+        if self.target_steps is not None and self.current_step not in self.target_steps:
+            return False
+        return self._should_capture_layer(layer_name)
+
+    def record(self, layer_name: str, payload: Dict[str, Any]) -> None:
+        if not self.should_capture(layer_name):
+            return
+        saved_payload = dict(payload)
+        saved_payload.setdefault("layer_name", layer_name)
+        saved_payload.setdefault("step", int(self.current_step))
+        self.buffer.setdefault(layer_name, []).append(_detach_to_cpu(saved_payload))
+
+    def step(self, current_step_index: int) -> None:
+        self.current_step = int(current_step_index)
+
+    def save_buffer(self) -> None:
+        if not self.buffer:
+            return
+        step_dir = os.path.join(self.save_dir, f"step_{self.current_step}")
+        os.makedirs(step_dir, exist_ok=True)
+        for layer_name, payloads in self.buffer.items():
+            safe_name = layer_name.replace(".", "_")
+            for payload_idx, payload in enumerate(payloads):
+                file_name = f"{safe_name}.pt"
+                if len(payloads) > 1:
+                    file_name = f"{safe_name}__call_{payload_idx}.pt"
+                torch.save(payload, os.path.join(step_dir, file_name))
+        self.buffer = {}
+
+    def clear(self) -> None:
+        self.buffer = {}
+        self.current_step = 0
+
+    def get_collected_data(self) -> str:
+        return self.save_dir
+
+
+def _validate_tiled_wa_module(
+    in_features: int,
+    out_features: int,
+    *,
+    layer_name: str,
+    cfg: QuantConfig,
+) -> None:
+    if cfg.linear_quant_mode != "tiled_wa":
+        return
+    k_tile = int(cfg.w_group_size)
+    n_tile = int(cfg.n_tile)
+    if in_features % k_tile != 0:
+        raise ValueError(
+            f"Layer '{layer_name}' requires in_features={in_features} to be divisible by "
+            f"k_tile={k_tile} for linear_quant_mode='tiled_wa'."
+        )
+    if out_features % n_tile != 0:
+        raise ValueError(
+            f"Layer '{layer_name}' requires out_features={out_features} to be divisible by "
+            f"n_tile={n_tile} for linear_quant_mode='tiled_wa'."
+        )
+
+
 class QuantLinearInference(nn.Linear):
     def __init__(
         self,
@@ -303,8 +437,9 @@ class QuantLinearInference(nn.Linear):
             in_features, out_features, bias=bias, dtype=dtype, device=device
         )
         self.layer_name = layer_name
+        self.linear_quant_mode = cfg.linear_quant_mode
         self.activation_enabled = bool(
-            cfg.linear_quant_mode == "wa" or cfg.activation_enabled
+            cfg.linear_quant_mode in {"wa", "tiled_wa"} or cfg.activation_enabled
         )
         self.act_bit = int(cfg.act_bit)
         self.act_group_size = int(cfg.act_group_size)
@@ -315,7 +450,86 @@ class QuantLinearInference(nn.Linear):
         self.act_e8_scale_op = cfg.act_e8_scale_op
         self.act_scale_quant = bool(cfg.act_scale_quant)
         self.act_scale_quant_2 = bool(cfg.act_scale_quant_2)
+        self.k_tile = int(cfg.w_group_size) if cfg.linear_quant_mode == "tiled_wa" else -1
+        self.n_tile = int(cfg.n_tile) if cfg.linear_quant_mode == "tiled_wa" else -1
+        self._tiled_wa_profiler: Optional[TiledWAProfiler] = None
         self._int_quant_fn = int_quant_fn
+
+    def set_tiled_wa_profiler(
+        self, profiler: Optional[TiledWAProfiler]
+    ) -> Optional[TiledWAProfiler]:
+        old_profiler = self._tiled_wa_profiler
+        self._tiled_wa_profiler = profiler
+        return old_profiler
+
+    def _forward_tiled_wa(self, x: torch.Tensor) -> torch.Tensor:
+        n_tile_ranges = [
+            (start, start + self.n_tile)
+            for start in range(0, self.out_features, self.n_tile)
+        ]
+        k_tile_ranges = [
+            (start, start + self.k_tile)
+            for start in range(0, self.in_features, self.k_tile)
+        ]
+        capture_psums = (
+            self._tiled_wa_profiler is not None
+            and self._tiled_wa_profiler.should_capture(self.layer_name)
+        )
+        output_tiles: List[torch.Tensor] = []
+        captured_psum_tiles: List[torch.Tensor] = []
+
+        for n_start, n_end in n_tile_ranges:
+            reduced_tile: Optional[torch.Tensor] = None
+            per_k_tiles: List[torch.Tensor] = []
+            for k_start, k_end in k_tile_ranges:
+                psum = F.linear(
+                    x[..., k_start:k_end],
+                    self.weight[n_start:n_end, k_start:k_end],
+                    None,
+                )
+                if capture_psums:
+                    per_k_tiles.append(psum.detach())
+                reduced_tile = psum if reduced_tile is None else reduced_tile + psum
+            if reduced_tile is None:
+                raise RuntimeError(
+                    f"Layer '{self.layer_name}' produced no tiled partial sums."
+                )
+            if self.bias is not None:
+                reduced_tile = reduced_tile + self.bias[n_start:n_end]
+            output_tiles.append(reduced_tile)
+            if capture_psums:
+                captured_psum_tiles.append(torch.stack(per_k_tiles, dim=0))
+
+        output = torch.cat(output_tiles, dim=-1)
+        if capture_psums and self._tiled_wa_profiler is not None:
+            psum_tiles = torch.stack(captured_psum_tiles, dim=0)
+            self._tiled_wa_profiler.record(
+                self.layer_name,
+                {
+                    "linear_quant_mode": self.linear_quant_mode,
+                    "input_shape": tuple(x.shape),
+                    "weight_shape": tuple(self.weight.shape),
+                    "output_shape": tuple(output.shape),
+                    "k_tile": int(self.k_tile),
+                    "n_tile": int(self.n_tile),
+                    "num_k_tiles": len(k_tile_ranges),
+                    "num_n_tiles": len(n_tile_ranges),
+                    "act_bit": int(self.act_bit),
+                    "weight_bit": int(getattr(self, "weight_bit", -1)),
+                    "act_group_size": int(self.act_group_size),
+                    "w_group_size": int(self.k_tile),
+                    "psum_tile_layout": [
+                        "n_tile_index",
+                        "k_tile_index",
+                        "input_leading_dims",
+                        "n_tile",
+                    ],
+                    "n_tile_ranges": n_tile_ranges,
+                    "k_tile_ranges": k_tile_ranges,
+                    "psum_tiles": psum_tiles,
+                },
+            )
+        return output
 
     @classmethod
     def from_linear(
@@ -326,6 +540,12 @@ class QuantLinearInference(nn.Linear):
         int_quant_fn: Callable,
         fp_quant_fn: Callable,
     ) -> Optional["QuantLinearInference"]:
+        _validate_tiled_wa_module(
+            original_module.in_features,
+            original_module.out_features,
+            layer_name=layer_name,
+            cfg=cfg,
+        )
         quantized_weight = quantize_weight_tensor(
             original_module.weight.data, layer_name, cfg, int_quant_fn, fp_quant_fn
         )
@@ -345,6 +565,7 @@ class QuantLinearInference(nn.Linear):
         with torch.no_grad():
             new_module.weight.copy_(quantized_weight.to(dtype=new_module.weight.dtype))
             new_module.weight.requires_grad_(False)
+            new_module.weight_bit = int(cfg.bit)
             if new_module.bias is not None and original_module.bias is not None:
                 new_module.bias.copy_(original_module.bias.data)
                 new_module.bias.requires_grad_(False)
@@ -367,7 +588,34 @@ class QuantLinearInference(nn.Linear):
                 act_scale_quant=self.act_scale_quant,
                 act_scale_quant_2=self.act_scale_quant_2,
             )
+        if self.linear_quant_mode == "tiled_wa":
+            return self._forward_tiled_wa(x)
         return F.linear(x, self.weight, self.bias)
 
 
-__all__ = ["QuantConfig", "QuantLinearInference", "quantize_weight_tensor"]
+def attach_tiled_wa_profiler(
+    model: nn.Module, profiler: Optional[TiledWAProfiler]
+) -> int:
+    attached_modules = 0
+    for module in model.modules():
+        if not isinstance(module, QuantLinearInference):
+            continue
+        if module.linear_quant_mode != "tiled_wa":
+            continue
+        module.set_tiled_wa_profiler(profiler)
+        attached_modules += 1
+    return attached_modules
+
+
+def detach_tiled_wa_profiler(model: nn.Module) -> int:
+    return attach_tiled_wa_profiler(model, None)
+
+
+__all__ = [
+    "QuantConfig",
+    "QuantLinearInference",
+    "TiledWAProfiler",
+    "attach_tiled_wa_profiler",
+    "detach_tiled_wa_profiler",
+    "quantize_weight_tensor",
+]
