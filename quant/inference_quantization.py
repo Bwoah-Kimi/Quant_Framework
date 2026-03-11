@@ -49,6 +49,12 @@ class QuantConfig:
 
     # Tiled W+A linear path params
     n_tile: int = -1
+    tiled_act_adaptive_enabled: bool = False
+    tiled_act_refresh_interval: int = 1
+    tiled_act_metric: str = "l1"  # "absmax", "l1", or "l2"
+    tiled_act_int0_threshold: float = 0.02
+    tiled_act_int2_threshold: float = 0.08
+    tiled_act_int4_threshold: float = 0.25
 
     # Attention quant params
     attn_quant_mode: str = "qkv"  # "qkv", "qkvo", "full"
@@ -155,6 +161,39 @@ class QuantConfig:
             if int(self.act_quant_dim) != -1:
                 raise ValueError(
                     "linear_quant_mode='tiled_wa' requires act_quant_dim == -1."
+                )
+        if self.tiled_act_adaptive_enabled:
+            if self.linear_quant_mode != "tiled_wa":
+                raise ValueError(
+                    "tiled_act_adaptive_enabled requires linear_quant_mode='tiled_wa'."
+                )
+            if int(self.tiled_act_refresh_interval) <= 0:
+                raise ValueError(
+                    "tiled_act_refresh_interval must be > 0 when adaptive tiled activation is enabled."
+                )
+            if self.tiled_act_metric not in {"absmax", "l1", "l2"}:
+                raise ValueError(
+                    "tiled_act_metric must be one of ['absmax', 'l1', 'l2']."
+                )
+            thresholds = [
+                float(self.tiled_act_int0_threshold),
+                float(self.tiled_act_int2_threshold),
+                float(self.tiled_act_int4_threshold),
+            ]
+            if any(value < 0.0 or value > 1.0 for value in thresholds):
+                raise ValueError(
+                    "tiled activation thresholds must be in the range [0, 1]."
+                )
+            if not (
+                thresholds[0] <= thresholds[1] <= thresholds[2]
+            ):
+                raise ValueError(
+                    "tiled activation thresholds must satisfy "
+                    "int0 <= int2 <= int4."
+                )
+            if int(self.act_bit) != 8:
+                raise ValueError(
+                    "Adaptive tiled activation currently assumes baseline act_bit == 8."
                 )
         if self.attn_quant_mode not in {"qkv", "qkvo", "full"}:
             raise ValueError(
@@ -324,6 +363,56 @@ def _detach_to_cpu(value: Any) -> Any:
     return value
 
 
+def _compute_tiled_act_metric(psum: torch.Tensor, metric: str) -> torch.Tensor:
+    psum_f = psum.float()
+    if metric == "absmax":
+        return psum_f.abs().amax()
+    if metric == "l1":
+        return psum_f.abs().sum()
+    if metric == "l2":
+        return torch.sqrt(torch.square(psum_f).sum())
+    raise ValueError(f"Unsupported tiled activation metric '{metric}'.")
+
+
+def _derive_tiled_act_quant_info(
+    tile_metrics: torch.Tensor,
+    *,
+    baseline_bit: int,
+    int0_threshold: float,
+    int2_threshold: float,
+    int4_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tile_metrics = tile_metrics.float()
+    ref = tile_metrics.amax()
+    if float(ref.item()) <= 0.0:
+        scores = torch.zeros_like(tile_metrics, dtype=torch.float32)
+    else:
+        scores = (tile_metrics / ref).clamp(0.0, 1.0)
+
+    act_quant_info = torch.full(
+        tile_metrics.shape,
+        int(baseline_bit),
+        dtype=torch.int8,
+        device=tile_metrics.device,
+    )
+    act_quant_info = torch.where(
+        scores < float(int4_threshold),
+        torch.full_like(act_quant_info, 4),
+        act_quant_info,
+    )
+    act_quant_info = torch.where(
+        scores < float(int2_threshold),
+        torch.full_like(act_quant_info, 2),
+        act_quant_info,
+    )
+    act_quant_info = torch.where(
+        scores < float(int0_threshold),
+        torch.zeros_like(act_quant_info),
+        act_quant_info,
+    )
+    return act_quant_info, scores
+
+
 class TiledWAProfiler:
     def __init__(
         self,
@@ -452,8 +541,19 @@ class QuantLinearInference(nn.Linear):
         self.act_scale_quant_2 = bool(cfg.act_scale_quant_2)
         self.k_tile = int(cfg.w_group_size) if cfg.linear_quant_mode == "tiled_wa" else -1
         self.n_tile = int(cfg.n_tile) if cfg.linear_quant_mode == "tiled_wa" else -1
+        self.tiled_act_adaptive_enabled = bool(
+            cfg.linear_quant_mode == "tiled_wa" and cfg.tiled_act_adaptive_enabled
+        )
+        self.tiled_act_refresh_interval = int(cfg.tiled_act_refresh_interval)
+        self.tiled_act_metric = cfg.tiled_act_metric
+        self.tiled_act_int0_threshold = float(cfg.tiled_act_int0_threshold)
+        self.tiled_act_int2_threshold = float(cfg.tiled_act_int2_threshold)
+        self.tiled_act_int4_threshold = float(cfg.tiled_act_int4_threshold)
         self._tiled_wa_profiler: Optional[TiledWAProfiler] = None
         self._int_quant_fn = int_quant_fn
+        self._tiled_forward_step = 0
+        self._act_quant_info: Optional[torch.Tensor] = None
+        self._last_act_scores: Optional[torch.Tensor] = None
 
     def set_tiled_wa_profiler(
         self, profiler: Optional[TiledWAProfiler]
@@ -461,6 +561,36 @@ class QuantLinearInference(nn.Linear):
         old_profiler = self._tiled_wa_profiler
         self._tiled_wa_profiler = profiler
         return old_profiler
+
+    def _should_refresh_tiled_act_quant(self) -> bool:
+        if not self.tiled_act_adaptive_enabled:
+            return False
+        if self._act_quant_info is None:
+            return True
+        return (self._tiled_forward_step % self.tiled_act_refresh_interval) == 0
+
+    def _quantize_activation_tile(
+        self,
+        x_tile: torch.Tensor,
+        *,
+        bit: int,
+    ) -> torch.Tensor:
+        if not self.activation_enabled or bit >= 16:
+            return x_tile
+        return _quantize_activation_runtime(
+            x_tile,
+            layer_name=self.layer_name,
+            int_quant_fn=self._int_quant_fn,
+            act_bit=int(bit),
+            act_group_size=self.act_group_size,
+            act_quant_dim=self.act_quant_dim,
+            act_strict_group_size=self.act_strict_group_size,
+            act_clip_style=self.act_clip_style,
+            act_e8_scale=self.act_e8_scale,
+            act_e8_scale_op=self.act_e8_scale_op,
+            act_scale_quant=self.act_scale_quant,
+            act_scale_quant_2=self.act_scale_quant_2,
+        )
 
     def _forward_tiled_wa(self, x: torch.Tensor) -> torch.Tensor:
         n_tile_ranges = [
@@ -475,18 +605,64 @@ class QuantLinearInference(nn.Linear):
             self._tiled_wa_profiler is not None
             and self._tiled_wa_profiler.should_capture(self.layer_name)
         )
+        refresh_act_quant = self._should_refresh_tiled_act_quant()
+        forward_step_idx = self._tiled_forward_step
+        quantized_input_cache: Dict[tuple[int, int], torch.Tensor] = {}
+        tile_metrics = None
+        if self.tiled_act_adaptive_enabled and refresh_act_quant:
+            tile_metrics = torch.zeros(
+                (len(n_tile_ranges), len(k_tile_ranges)),
+                dtype=torch.float32,
+                device=x.device,
+            )
+        applied_act_quant_info = None
+        if self.tiled_act_adaptive_enabled:
+            if refresh_act_quant or self._act_quant_info is None:
+                applied_act_quant_info = torch.full(
+                    (len(n_tile_ranges), len(k_tile_ranges)),
+                    int(self.act_bit),
+                    dtype=torch.int8,
+                )
+            else:
+                applied_act_quant_info = self._act_quant_info.clone()
+
         output_tiles: List[torch.Tensor] = []
         captured_psum_tiles: List[torch.Tensor] = []
 
-        for n_start, n_end in n_tile_ranges:
+        for n_idx, (n_start, n_end) in enumerate(n_tile_ranges):
             reduced_tile: Optional[torch.Tensor] = None
             per_k_tiles: List[torch.Tensor] = []
-            for k_start, k_end in k_tile_ranges:
-                psum = F.linear(
-                    x[..., k_start:k_end],
-                    self.weight[n_start:n_end, k_start:k_end],
-                    None,
-                )
+            for k_idx, (k_start, k_end) in enumerate(k_tile_ranges):
+                tile_bit = int(self.act_bit)
+                if (
+                    self.tiled_act_adaptive_enabled
+                    and not refresh_act_quant
+                    and applied_act_quant_info is not None
+                ):
+                    tile_bit = int(applied_act_quant_info[n_idx, k_idx].item())
+
+                if tile_bit <= 0:
+                    psum = x.new_zeros(x.shape[:-1] + (self.n_tile,))
+                else:
+                    cache_key = (k_idx, tile_bit)
+                    x_tile = quantized_input_cache.get(cache_key)
+                    if x_tile is None:
+                        x_tile = self._quantize_activation_tile(
+                            x[..., k_start:k_end],
+                            bit=tile_bit,
+                        )
+                        quantized_input_cache[cache_key] = x_tile
+                    psum = F.linear(
+                        x_tile,
+                        self.weight[n_start:n_end, k_start:k_end],
+                        None,
+                    )
+
+                if tile_metrics is not None:
+                    tile_metrics[n_idx, k_idx] = _compute_tiled_act_metric(
+                        psum,
+                        self.tiled_act_metric,
+                    )
                 if capture_psums:
                     per_k_tiles.append(psum.detach())
                 reduced_tile = psum if reduced_tile is None else reduced_tile + psum
@@ -501,34 +677,61 @@ class QuantLinearInference(nn.Linear):
                 captured_psum_tiles.append(torch.stack(per_k_tiles, dim=0))
 
         output = torch.cat(output_tiles, dim=-1)
+        next_act_quant_info = None
+        next_act_scores = None
+        if tile_metrics is not None:
+            next_act_quant_info, next_act_scores = _derive_tiled_act_quant_info(
+                tile_metrics,
+                baseline_bit=int(self.act_bit),
+                int0_threshold=self.tiled_act_int0_threshold,
+                int2_threshold=self.tiled_act_int2_threshold,
+                int4_threshold=self.tiled_act_int4_threshold,
+            )
+            self._act_quant_info = next_act_quant_info.detach().cpu()
+            self._last_act_scores = next_act_scores.detach().cpu()
+        elif self.tiled_act_adaptive_enabled and self._act_quant_info is not None:
+            next_act_quant_info = self._act_quant_info.clone()
+
         if capture_psums and self._tiled_wa_profiler is not None:
             psum_tiles = torch.stack(captured_psum_tiles, dim=0)
-            self._tiled_wa_profiler.record(
-                self.layer_name,
-                {
-                    "linear_quant_mode": self.linear_quant_mode,
-                    "input_shape": tuple(x.shape),
-                    "weight_shape": tuple(self.weight.shape),
-                    "output_shape": tuple(output.shape),
-                    "k_tile": int(self.k_tile),
-                    "n_tile": int(self.n_tile),
-                    "num_k_tiles": len(k_tile_ranges),
-                    "num_n_tiles": len(n_tile_ranges),
-                    "act_bit": int(self.act_bit),
-                    "weight_bit": int(getattr(self, "weight_bit", -1)),
-                    "act_group_size": int(self.act_group_size),
-                    "w_group_size": int(self.k_tile),
-                    "psum_tile_layout": [
-                        "n_tile_index",
-                        "k_tile_index",
-                        "input_leading_dims",
-                        "n_tile",
-                    ],
-                    "n_tile_ranges": n_tile_ranges,
-                    "k_tile_ranges": k_tile_ranges,
-                    "psum_tiles": psum_tiles,
-                },
-            )
+            payload = {
+                "linear_quant_mode": self.linear_quant_mode,
+                "input_shape": tuple(x.shape),
+                "weight_shape": tuple(self.weight.shape),
+                "output_shape": tuple(output.shape),
+                "k_tile": int(self.k_tile),
+                "n_tile": int(self.n_tile),
+                "num_k_tiles": len(k_tile_ranges),
+                "num_n_tiles": len(n_tile_ranges),
+                "act_bit": int(self.act_bit),
+                "weight_bit": int(getattr(self, "weight_bit", -1)),
+                "act_group_size": int(self.act_group_size),
+                "w_group_size": int(self.k_tile),
+                "forward_step_idx": int(forward_step_idx),
+                "psum_tile_layout": [
+                    "n_tile_index",
+                    "k_tile_index",
+                    "input_leading_dims",
+                    "n_tile",
+                ],
+                "n_tile_ranges": n_tile_ranges,
+                "k_tile_ranges": k_tile_ranges,
+                "psum_tiles": psum_tiles,
+            }
+            if self.tiled_act_adaptive_enabled:
+                payload.update(
+                    {
+                        "adaptive_act_enabled": True,
+                        "adaptive_act_metric": self.tiled_act_metric,
+                        "adaptive_act_refresh_interval": int(self.tiled_act_refresh_interval),
+                        "adaptive_act_refresh_step": bool(refresh_act_quant),
+                        "adaptive_act_applied_bits": applied_act_quant_info,
+                        "adaptive_act_next_bits": next_act_quant_info,
+                        "adaptive_act_scores": next_act_scores if refresh_act_quant else None,
+                    }
+                )
+            self._tiled_wa_profiler.record(self.layer_name, payload)
+        self._tiled_forward_step += 1
         return output
 
     @classmethod
@@ -573,6 +776,8 @@ class QuantLinearInference(nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x = input
+        if self.linear_quant_mode == "tiled_wa":
+            return self._forward_tiled_wa(x)
         if self.activation_enabled:
             x = _quantize_activation_runtime(
                 x,
@@ -588,8 +793,6 @@ class QuantLinearInference(nn.Linear):
                 act_scale_quant=self.act_scale_quant,
                 act_scale_quant_2=self.act_scale_quant_2,
             )
-        if self.linear_quant_mode == "tiled_wa":
-            return self._forward_tiled_wa(x)
         return F.linear(x, self.weight, self.bias)
 
 
