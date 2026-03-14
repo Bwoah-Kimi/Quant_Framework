@@ -1,6 +1,19 @@
 import torch
 
 
+def resolve_int_quant_bounds(bit, clip_style="sym"):
+    if int(bit) < 2:
+        raise ValueError(f"bit must be >= 2, got {bit}.")
+    qmax = 2**(int(bit) - 1) - 1
+    if clip_style == "sym":
+        qmin = -qmax
+    elif clip_style == "asym":
+        qmin = -2**(int(bit) - 1)
+    else:
+        raise ValueError("clip_style must be 'sym' or 'asym'")
+    return int(qmin), int(qmax)
+
+
 
 def cal_s_fp(x, Qmax, epsilon):
     dim = [-1]
@@ -129,16 +142,10 @@ def print_fp_quant(e_bit=5, m_bit=2):
     print(f"unique num in  4096 number: {len(torch.unique(quant_data))}")
 
 
-def int_quant(x, bit, dim=-1, group_size=-1, e8_scale=False, e8_scale_op="ceil", clip_style="sym", scale_quant=False, scale_quant_2=False):
+def int_quant_with_info(x, bit, dim=-1, group_size=-1, e8_scale=False, e8_scale_op="ceil", clip_style="sym", scale_quant=False, scale_quant_2=False):
     if bit >= 16:
-        return x
-    qmax = 2**(bit - 1) - 1
-    if clip_style == "sym":
-        qmin = -qmax
-    elif clip_style == "asym":
-        qmin = -2**(bit - 1)
-    else:
-        raise ValueError("clip_style must be 'sym' or 'asym'")
+        raise ValueError("int_quant_with_info requires bit < 16.")
+    qmin, qmax = resolve_int_quant_bounds(bit, clip_style)
     if group_size < 0:
         group_size = x.shape[dim]
     # Reshape tensor to group elements
@@ -188,5 +195,33 @@ def int_quant(x, bit, dim=-1, group_size=-1, e8_scale=False, e8_scale_op="ceil",
         print("x_scaled is nan")
         import pdb;pdb.set_trace()
     x_rounded = x_scaled.round()
-    x_quant = (x_rounded.clamp(qmin, qmax) * s).reshape(shape)
-    return x_quant
+    codes_grouped = x_rounded.clamp(qmin, qmax).to(dtype=torch.int16)
+    x_quant = (codes_grouped.to(dtype=x.dtype) * s).reshape(shape)
+    return {
+        "codes": codes_grouped.reshape(shape),
+        "codes_grouped": codes_grouped,
+        "dequant": x_quant,
+        "scales": s,
+        "xmax": xmax,
+        "qmin": qmin,
+        "qmax": qmax,
+        "group_size": int(group_size),
+        "num_groups": int(num_groups),
+        "grouped_shape": tuple(int(v) for v in new_shape),
+    }
+
+
+def int_quant(x, bit, dim=-1, group_size=-1, e8_scale=False, e8_scale_op="ceil", clip_style="sym", scale_quant=False, scale_quant_2=False):
+    if bit >= 16:
+        return x
+    return int_quant_with_info(
+        x,
+        bit=bit,
+        dim=dim,
+        group_size=group_size,
+        e8_scale=e8_scale,
+        e8_scale_op=e8_scale_op,
+        clip_style=clip_style,
+        scale_quant=scale_quant,
+        scale_quant_2=scale_quant_2,
+    )["dequant"]

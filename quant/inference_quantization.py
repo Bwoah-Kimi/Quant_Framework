@@ -440,13 +440,13 @@ class TiledWAProfiler:
             return True
         parts = name.split(".")
         for idx, part in enumerate(parts):
-            if part == "layers" and idx + 1 < len(parts):
+            if part in {"layers", "blocks"} and idx + 1 < len(parts):
                 try:
                     layer_idx = int(parts[idx + 1])
                 except ValueError:
                     continue
                 return layer_idx in self.target_layer_indices
-        return True
+        return False
 
     def should_capture(self, layer_name: str) -> bool:
         if self.target_steps is not None and self.current_step not in self.target_steps:
