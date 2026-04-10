@@ -170,9 +170,13 @@ class QuantConfig:
                 raise ValueError(
                     "tiled_act_refresh_interval must be > 0 when adaptive tiled activation is enabled."
                 )
-            if self.tiled_act_metric not in {"absmax", "l1", "l2"}:
+            if self.tiled_act_metric not in {
+                "absmax", "l1", "l2",
+                "exp_spread", "exp_concentration", "exp_spread_nz_frac",
+            }:
                 raise ValueError(
-                    "tiled_act_metric must be one of ['absmax', 'l1', 'l2']."
+                    "tiled_act_metric must be one of "
+                    "['absmax', 'l1', 'l2', 'exp_spread', 'exp_concentration', 'exp_spread_nz_frac']."
                 )
             thresholds = [
                 float(self.tiled_act_int0_threshold),
@@ -358,6 +362,18 @@ def _detach_to_cpu(value: Any) -> Any:
     return value
 
 
+_EXP_CONCENTRATION_BAND = 4
+
+
+def _extract_bf16_exponents(psum_f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (exponent tensor, nonzero mask) from a float PSUM via BF16 bit extraction."""
+    psum_bf16 = psum_f.bfloat16()
+    bits = psum_bf16.view(torch.int16)
+    exp = (bits >> 7) & 0xFF
+    nonzero_mask = exp != 0
+    return exp, nonzero_mask
+
+
 def _compute_tiled_act_metric(psum: torch.Tensor, metric: str) -> torch.Tensor:
     psum_f = psum.float()
     if metric == "absmax":
@@ -366,6 +382,29 @@ def _compute_tiled_act_metric(psum: torch.Tensor, metric: str) -> torch.Tensor:
         return psum_f.abs().sum()
     if metric == "l2":
         return torch.sqrt(torch.square(psum_f).sum())
+    if metric == "exp_spread":
+        exp, nonzero_mask = _extract_bf16_exponents(psum_f)
+        if not nonzero_mask.any():
+            return torch.tensor(0.0, device=psum.device)
+        exp_nz = exp[nonzero_mask].float()
+        return exp_nz.amax() - exp_nz.amin()
+    if metric == "exp_concentration":
+        exp, nonzero_mask = _extract_bf16_exponents(psum_f)
+        if not nonzero_mask.any():
+            return torch.tensor(0.0, device=psum.device)
+        exp_nz = exp[nonzero_mask].float()
+        max_exp = exp_nz.amax()
+        concentrated = (exp_nz >= max_exp - _EXP_CONCENTRATION_BAND).sum()
+        return 1.0 - (concentrated.float() / exp_nz.numel())
+    if metric == "exp_spread_nz_frac":
+        exp, nonzero_mask = _extract_bf16_exponents(psum_f)
+        nz_count = nonzero_mask.sum()
+        if nz_count == 0:
+            return torch.tensor(0.0, device=psum.device)
+        exp_nz = exp[nonzero_mask].float()
+        spread = exp_nz.amax() - exp_nz.amin()
+        nz_frac = nz_count.float() / exp.numel()
+        return spread * nz_frac
     raise ValueError(f"Unsupported tiled activation metric '{metric}'.")
 
 
