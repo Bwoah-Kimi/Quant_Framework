@@ -53,7 +53,6 @@ class QuantConfig:
     tiled_act_refresh_interval: int = 1
     tiled_act_metric: str = "l1"  # "absmax", "l1", or "l2"
     tiled_act_int0_threshold: float = 0.02
-    tiled_act_int2_threshold: float = 0.08
     tiled_act_int4_threshold: float = 0.25
 
     # Attention quant params
@@ -177,19 +176,15 @@ class QuantConfig:
                 )
             thresholds = [
                 float(self.tiled_act_int0_threshold),
-                float(self.tiled_act_int2_threshold),
                 float(self.tiled_act_int4_threshold),
             ]
             if any(value < 0.0 or value > 1.0 for value in thresholds):
                 raise ValueError(
                     "tiled activation thresholds must be in the range [0, 1]."
                 )
-            if not (
-                thresholds[0] <= thresholds[1] <= thresholds[2]
-            ):
+            if not thresholds[0] <= thresholds[1]:
                 raise ValueError(
-                    "tiled activation thresholds must satisfy "
-                    "int0 <= int2 <= int4."
+                    "tiled activation thresholds must satisfy int0 <= int4."
                 )
             if int(self.act_bit) != 8:
                 raise ValueError(
@@ -379,7 +374,6 @@ def _derive_tiled_act_quant_info(
     *,
     baseline_bit: int,
     int0_threshold: float,
-    int2_threshold: float,
     int4_threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tile_metrics = tile_metrics.float()
@@ -398,11 +392,6 @@ def _derive_tiled_act_quant_info(
     act_quant_info = torch.where(
         scores < float(int4_threshold),
         torch.full_like(act_quant_info, 4),
-        act_quant_info,
-    )
-    act_quant_info = torch.where(
-        scores < float(int2_threshold),
-        torch.full_like(act_quant_info, 2),
         act_quant_info,
     )
     act_quant_info = torch.where(
@@ -547,7 +536,6 @@ class QuantLinearInference(nn.Linear):
         self.tiled_act_refresh_interval = int(cfg.tiled_act_refresh_interval)
         self.tiled_act_metric = cfg.tiled_act_metric
         self.tiled_act_int0_threshold = float(cfg.tiled_act_int0_threshold)
-        self.tiled_act_int2_threshold = float(cfg.tiled_act_int2_threshold)
         self.tiled_act_int4_threshold = float(cfg.tiled_act_int4_threshold)
         self._tiled_wa_profiler: Optional[TiledWAProfiler] = None
         self._int_quant_fn = int_quant_fn
@@ -684,7 +672,6 @@ class QuantLinearInference(nn.Linear):
                 tile_metrics,
                 baseline_bit=int(self.act_bit),
                 int0_threshold=self.tiled_act_int0_threshold,
-                int2_threshold=self.tiled_act_int2_threshold,
                 int4_threshold=self.tiled_act_int4_threshold,
             )
             self._act_quant_info = next_act_quant_info.detach().cpu()
