@@ -51,8 +51,7 @@ class QuantConfig:
     n_tile: int = -1
     tiled_act_adaptive_enabled: bool = False
     tiled_act_refresh_interval: int = 1
-    tiled_act_metric: str = "l1"  # "absmax", "l1", or "l2"
-    tiled_act_int0_threshold: float = 0.02
+    tiled_act_metric: str = "l1"  # "absmax", "l1", "l2", "exp_spread", "exp_concentration", or "exp_spread_nz_frac"
     tiled_act_int4_threshold: float = 0.25
 
     # Attention quant params
@@ -178,17 +177,10 @@ class QuantConfig:
                     "tiled_act_metric must be one of "
                     "['absmax', 'l1', 'l2', 'exp_spread', 'exp_concentration', 'exp_spread_nz_frac']."
                 )
-            thresholds = [
-                float(self.tiled_act_int0_threshold),
-                float(self.tiled_act_int4_threshold),
-            ]
-            if any(value < 0.0 or value > 1.0 for value in thresholds):
+            threshold = float(self.tiled_act_int4_threshold)
+            if threshold < 0.0 or threshold > 1.0:
                 raise ValueError(
-                    "tiled activation thresholds must be in the range [0, 1]."
-                )
-            if not thresholds[0] <= thresholds[1]:
-                raise ValueError(
-                    "tiled activation thresholds must satisfy int0 <= int4."
+                    "tiled activation INT4 threshold must be in the range [0, 1]."
                 )
             if int(self.act_bit) != 8:
                 raise ValueError(
@@ -412,7 +404,6 @@ def _derive_tiled_act_quant_info(
     tile_metrics: torch.Tensor,
     *,
     baseline_bit: int,
-    int0_threshold: float,
     int4_threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tile_metrics = tile_metrics.float()
@@ -431,11 +422,6 @@ def _derive_tiled_act_quant_info(
     act_quant_info = torch.where(
         scores < float(int4_threshold),
         torch.full_like(act_quant_info, 4),
-        act_quant_info,
-    )
-    act_quant_info = torch.where(
-        scores < float(int0_threshold),
-        torch.zeros_like(act_quant_info),
         act_quant_info,
     )
     return act_quant_info, scores
@@ -574,7 +560,6 @@ class QuantLinearInference(nn.Linear):
         )
         self.tiled_act_refresh_interval = int(cfg.tiled_act_refresh_interval)
         self.tiled_act_metric = cfg.tiled_act_metric
-        self.tiled_act_int0_threshold = float(cfg.tiled_act_int0_threshold)
         self.tiled_act_int4_threshold = float(cfg.tiled_act_int4_threshold)
         self._tiled_wa_profiler: Optional[TiledWAProfiler] = None
         self._int_quant_fn = int_quant_fn
@@ -668,22 +653,19 @@ class QuantLinearInference(nn.Linear):
                 ):
                     tile_bit = int(applied_act_quant_info[n_idx, k_idx].item())
 
-                if tile_bit <= 0:
-                    psum = x.new_zeros(x.shape[:-1] + (self.n_tile,))
-                else:
-                    cache_key = (k_idx, tile_bit)
-                    x_tile = quantized_input_cache.get(cache_key)
-                    if x_tile is None:
-                        x_tile = self._quantize_activation_tile(
-                            x[..., k_start:k_end],
-                            bit=tile_bit,
-                        )
-                        quantized_input_cache[cache_key] = x_tile
-                    psum = F.linear(
-                        x_tile,
-                        self.weight[n_start:n_end, k_start:k_end],
-                        None,
+                cache_key = (k_idx, tile_bit)
+                x_tile = quantized_input_cache.get(cache_key)
+                if x_tile is None:
+                    x_tile = self._quantize_activation_tile(
+                        x[..., k_start:k_end],
+                        bit=tile_bit,
                     )
+                    quantized_input_cache[cache_key] = x_tile
+                psum = F.linear(
+                    x_tile,
+                    self.weight[n_start:n_end, k_start:k_end],
+                    None,
+                )
 
                 if tile_metrics is not None:
                     tile_metrics[n_idx, k_idx] = _compute_tiled_act_metric(
@@ -710,7 +692,6 @@ class QuantLinearInference(nn.Linear):
             next_act_quant_info, next_act_scores = _derive_tiled_act_quant_info(
                 tile_metrics,
                 baseline_bit=int(self.act_bit),
-                int0_threshold=self.tiled_act_int0_threshold,
                 int4_threshold=self.tiled_act_int4_threshold,
             )
             self._act_quant_info = next_act_quant_info.detach().cpu()
