@@ -355,6 +355,8 @@ def _detach_to_cpu(value: Any) -> Any:
 
 
 _EXP_CONCENTRATION_BAND = 4
+_TILED_WA_PSUM_CHUNK_TARGET_BYTES = 64 * 1024 * 1024
+_TILED_WA_OUTPUT_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
 
 
 def _extract_bf16_exponents(psum_f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -425,6 +427,49 @@ def _derive_tiled_act_quant_info(
         act_quant_info,
     )
     return act_quant_info, scores
+
+
+def _compute_tiled_act_metrics(
+    psum_tiles: torch.Tensor,
+    metric: str,
+) -> torch.Tensor:
+    """Vectorized tile metric reduction for PSUM tiles shaped [flat_batch, num_n_tiles, num_k_tiles, n_tile]."""
+    if psum_tiles.ndim != 4:
+        raise ValueError(
+            f"Expected PSUM tiles with shape [flat_batch, num_n_tiles, num_k_tiles, n_tile], got {tuple(psum_tiles.shape)}."
+        )
+    flat = psum_tiles.permute(1, 2, 0, 3).reshape(psum_tiles.shape[1], psum_tiles.shape[2], -1)
+    flat_f = flat.float()
+    if metric == "absmax":
+        return flat_f.abs().amax(dim=-1)
+    if metric == "l1":
+        return flat_f.abs().sum(dim=-1)
+    if metric == "l2":
+        return torch.sqrt(torch.square(flat_f).sum(dim=-1))
+
+    exp, nonzero_mask = _extract_bf16_exponents(flat_f)
+    has_nonzero = nonzero_mask.any(dim=-1)
+    exp_f = exp.float()
+    max_exp = exp_f.masked_fill(~nonzero_mask, float("-inf")).amax(dim=-1)
+    zeros = torch.zeros_like(max_exp)
+
+    if metric == "exp_spread":
+        min_exp = exp_f.masked_fill(~nonzero_mask, float("inf")).amin(dim=-1)
+        spread = max_exp - min_exp
+        return torch.where(has_nonzero, spread, zeros)
+    if metric == "exp_concentration":
+        nz_count = nonzero_mask.sum(dim=-1)
+        concentrated = (
+            (exp_f >= (max_exp.unsqueeze(-1) - _EXP_CONCENTRATION_BAND)) & nonzero_mask
+        ).sum(dim=-1)
+        score = 1.0 - (concentrated.float() / nz_count.clamp_min(1).float())
+        return torch.where(has_nonzero, score, zeros)
+    if metric == "exp_spread_nz_frac":
+        min_exp = exp_f.masked_fill(~nonzero_mask, float("inf")).amin(dim=-1)
+        spread = max_exp - min_exp
+        nz_frac = nonzero_mask.sum(dim=-1).float() / float(flat.shape[-1])
+        return torch.where(has_nonzero, spread * nz_frac, zeros)
+    raise ValueError(f"Unsupported tiled activation metric '{metric}'.")
 
 
 class TiledWAProfiler:
@@ -555,6 +600,22 @@ class QuantLinearInference(nn.Linear):
         self.act_scale_quant_2 = bool(cfg.act_scale_quant_2)
         self.k_tile = int(cfg.w_group_size) if cfg.linear_quant_mode == "tiled_wa" else -1
         self.n_tile = int(cfg.n_tile) if cfg.linear_quant_mode == "tiled_wa" else -1
+        if cfg.linear_quant_mode == "tiled_wa":
+            self.num_k_tiles = int(self.in_features // self.k_tile)
+            self.num_n_tiles = int(self.out_features // self.n_tile)
+            self._k_tile_ranges = [
+                (start, start + self.k_tile)
+                for start in range(0, self.in_features, self.k_tile)
+            ]
+            self._n_tile_ranges = [
+                (start, start + self.n_tile)
+                for start in range(0, self.out_features, self.n_tile)
+            ]
+        else:
+            self.num_k_tiles = 0
+            self.num_n_tiles = 0
+            self._k_tile_ranges = []
+            self._n_tile_ranges = []
         self.tiled_act_adaptive_enabled = bool(
             cfg.linear_quant_mode == "tiled_wa" and cfg.tiled_act_adaptive_enabled
         )
@@ -604,88 +665,236 @@ class QuantLinearInference(nn.Linear):
             act_scale_quant_2=self.act_scale_quant_2,
         )
 
+    def _reshape_tiled_input(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[tuple[int, ...], torch.Tensor]:
+        leading_shape = tuple(int(v) for v in x.shape[:-1])
+        flat_batch = int(x.numel() // self.in_features)
+        x_flat = x.reshape(flat_batch, self.in_features)
+        return leading_shape, x_flat.view(flat_batch, self.num_k_tiles, self.k_tile)
+
+    def _weight_tiles_view(self) -> torch.Tensor:
+        return self.weight.view(
+            self.num_n_tiles,
+            self.n_tile,
+            self.num_k_tiles,
+            self.k_tile,
+        ).permute(0, 2, 1, 3)
+
+    def _reshape_tiled_output(
+        self,
+        output_tiles: torch.Tensor,
+        leading_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        output_flat = output_tiles.reshape(-1, self.out_features)
+        if leading_shape:
+            return output_flat.reshape(*leading_shape, self.out_features)
+        return output_flat.reshape(self.out_features)
+
+    def _reshape_captured_psum_tiles(
+        self,
+        psum_tiles: torch.Tensor,
+        leading_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        psum_layout = psum_tiles.permute(1, 2, 0, 3)
+        if leading_shape:
+            return psum_layout.reshape(
+                self.num_n_tiles,
+                self.num_k_tiles,
+                *leading_shape,
+                self.n_tile,
+            )
+        return psum_layout.reshape(
+            self.num_n_tiles,
+            self.num_k_tiles,
+            self.n_tile,
+        )
+
+    def _resolve_n_tile_chunk_size(
+        self,
+        flat_batch: int,
+        *,
+        need_psum_tensor: bool,
+        bytes_per_element: int,
+    ) -> int:
+        if self.num_n_tiles <= 0:
+            return 1
+        if need_psum_tensor:
+            target_bytes = _TILED_WA_PSUM_CHUNK_TARGET_BYTES
+            per_n_tile_bytes = flat_batch * self.num_k_tiles * self.n_tile * bytes_per_element
+        else:
+            target_bytes = _TILED_WA_OUTPUT_CHUNK_TARGET_BYTES
+            per_n_tile_bytes = flat_batch * self.n_tile * bytes_per_element
+        if per_n_tile_bytes <= 0:
+            return self.num_n_tiles
+        chunk = int(target_bytes // per_n_tile_bytes)
+        return max(1, min(self.num_n_tiles, chunk))
+
+    def _compute_chunked_full_tiled_output(
+        self,
+        x_tiles: torch.Tensor,
+        weight_tiles: torch.Tensor,
+        *,
+        bit: int,
+        capture_psums: bool,
+        compute_metrics: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        quantized_x_tiles = self._quantize_activation_tile(x_tiles, bit=bit)
+        flat_batch = int(x_tiles.shape[0])
+        bytes_per_element = int(max(quantized_x_tiles.element_size(), self.weight.element_size()))
+        n_tile_chunk_size = self._resolve_n_tile_chunk_size(
+            flat_batch,
+            need_psum_tensor=bool(capture_psums or compute_metrics),
+            bytes_per_element=bytes_per_element,
+        )
+        output_tiles = x_tiles.new_empty((flat_batch, self.num_n_tiles, self.n_tile))
+        tile_metrics = None
+        if compute_metrics:
+            tile_metrics = torch.empty(
+                (self.num_n_tiles, self.num_k_tiles),
+                dtype=torch.float32,
+                device=x_tiles.device,
+            )
+        captured_psum_chunks = [] if capture_psums else None
+
+        for n_start in range(0, self.num_n_tiles, n_tile_chunk_size):
+            n_end = min(self.num_n_tiles, n_start + n_tile_chunk_size)
+            weight_chunk = weight_tiles[n_start:n_end]
+            if capture_psums or compute_metrics:
+                psum_chunk = torch.einsum("bkj,nkoj->bnko", quantized_x_tiles, weight_chunk)
+                output_tiles[:, n_start:n_end] = psum_chunk.sum(dim=2)
+                if tile_metrics is not None:
+                    tile_metrics[n_start:n_end] = _compute_tiled_act_metrics(
+                        psum_chunk,
+                        self.tiled_act_metric,
+                    )
+                if captured_psum_chunks is not None:
+                    captured_psum_chunks.append(psum_chunk.detach().cpu())
+            else:
+                output_tiles[:, n_start:n_end] = torch.einsum(
+                    "bkj,nkoj->bno",
+                    quantized_x_tiles,
+                    weight_chunk,
+                )
+
+        psum_tiles = None
+        if captured_psum_chunks is not None:
+            psum_tiles = torch.cat(captured_psum_chunks, dim=1)
+        return output_tiles, psum_tiles, tile_metrics
+
+    def _compute_chunked_grouped_tiled_output(
+        self,
+        x_tiles: torch.Tensor,
+        weight_tiles: torch.Tensor,
+        act_quant_info: torch.Tensor,
+        *,
+        capture_psums: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        act_quant_info_device = act_quant_info.to(device=x_tiles.device, dtype=torch.int8)
+        quantized_x_by_bit: Dict[int, torch.Tensor] = {}
+        flat_batch = int(x_tiles.shape[0])
+        bytes_per_element = int(max(x_tiles.element_size(), self.weight.element_size()))
+        n_tile_chunk_size = self._resolve_n_tile_chunk_size(
+            flat_batch,
+            need_psum_tensor=True,
+            bytes_per_element=bytes_per_element,
+        )
+        output_tiles = x_tiles.new_empty((flat_batch, self.num_n_tiles, self.n_tile))
+        captured_psum_chunks = [] if capture_psums else None
+
+        for n_start in range(0, self.num_n_tiles, n_tile_chunk_size):
+            n_end = min(self.num_n_tiles, n_start + n_tile_chunk_size)
+            chunk_num_n_tiles = n_end - n_start
+            weight_chunk = weight_tiles[n_start:n_end]
+            act_quant_chunk = act_quant_info_device[n_start:n_end]
+            flat_bits = act_quant_chunk.reshape(-1)
+            psum_chunk = x_tiles.new_zeros(
+                (flat_batch, chunk_num_n_tiles, self.num_k_tiles, self.n_tile)
+            )
+            psum_chunk_flat = psum_chunk.view(
+                flat_batch,
+                chunk_num_n_tiles * self.num_k_tiles,
+                self.n_tile,
+            )
+
+            for bit in (4, int(self.act_bit)):
+                pair_idx = torch.nonzero(flat_bits == int(bit), as_tuple=False).flatten()
+                if pair_idx.numel() == 0:
+                    continue
+                quantized_x_tiles = quantized_x_by_bit.get(int(bit))
+                if quantized_x_tiles is None:
+                    quantized_x_tiles = self._quantize_activation_tile(
+                        x_tiles,
+                        bit=int(bit),
+                    )
+                    quantized_x_by_bit[int(bit)] = quantized_x_tiles
+
+                n_indices = torch.div(pair_idx, self.num_k_tiles, rounding_mode="floor")
+                k_indices = torch.remainder(pair_idx, self.num_k_tiles)
+                x_selected = quantized_x_tiles.index_select(1, k_indices)
+                weight_selected = weight_chunk[n_indices, k_indices]
+                psum_selected = torch.einsum("btk,tok->bto", x_selected, weight_selected)
+                psum_chunk_flat.index_copy_(1, pair_idx, psum_selected)
+
+            output_tiles[:, n_start:n_end] = psum_chunk.sum(dim=2)
+            if captured_psum_chunks is not None:
+                captured_psum_chunks.append(psum_chunk.detach().cpu())
+
+        psum_tiles = None
+        if captured_psum_chunks is not None:
+            psum_tiles = torch.cat(captured_psum_chunks, dim=1)
+        return output_tiles, psum_tiles
+
     def _forward_tiled_wa(self, x: torch.Tensor) -> torch.Tensor:
-        n_tile_ranges = [
-            (start, start + self.n_tile)
-            for start in range(0, self.out_features, self.n_tile)
-        ]
-        k_tile_ranges = [
-            (start, start + self.k_tile)
-            for start in range(0, self.in_features, self.k_tile)
-        ]
         capture_psums = (
             self._tiled_wa_profiler is not None
             and self._tiled_wa_profiler.should_capture(self.layer_name)
         )
         refresh_act_quant = self._should_refresh_tiled_act_quant()
         forward_step_idx = self._tiled_forward_step
-        quantized_input_cache: Dict[tuple[int, int], torch.Tensor] = {}
+        leading_shape, x_tiles = self._reshape_tiled_input(x)
+        weight_tiles = self._weight_tiles_view()
+
         tile_metrics = None
-        if self.tiled_act_adaptive_enabled and refresh_act_quant:
-            tile_metrics = torch.zeros(
-                (len(n_tile_ranges), len(k_tile_ranges)),
-                dtype=torch.float32,
-                device=x.device,
-            )
         applied_act_quant_info = None
         if self.tiled_act_adaptive_enabled:
             if refresh_act_quant or self._act_quant_info is None:
                 applied_act_quant_info = torch.full(
-                    (len(n_tile_ranges), len(k_tile_ranges)),
+                    (self.num_n_tiles, self.num_k_tiles),
                     int(self.act_bit),
                     dtype=torch.int8,
                 )
             else:
                 applied_act_quant_info = self._act_quant_info.clone()
 
-        output_tiles: List[torch.Tensor] = []
-        captured_psum_tiles: List[torch.Tensor] = []
+        compute_metrics = bool(self.tiled_act_adaptive_enabled and refresh_act_quant)
+        psum_tiles = None
+        if (
+            self.tiled_act_adaptive_enabled
+            and not refresh_act_quant
+            and applied_act_quant_info is not None
+        ):
+            output_tiles, psum_tiles = self._compute_chunked_grouped_tiled_output(
+                x_tiles,
+                weight_tiles,
+                applied_act_quant_info,
+                capture_psums=capture_psums,
+            )
+        else:
+            output_tiles, psum_tiles, tile_metrics = self._compute_chunked_full_tiled_output(
+                x_tiles,
+                weight_tiles,
+                bit=int(self.act_bit),
+                capture_psums=capture_psums,
+                compute_metrics=compute_metrics,
+            )
 
-        for n_idx, (n_start, n_end) in enumerate(n_tile_ranges):
-            reduced_tile: Optional[torch.Tensor] = None
-            per_k_tiles: List[torch.Tensor] = []
-            for k_idx, (k_start, k_end) in enumerate(k_tile_ranges):
-                tile_bit = int(self.act_bit)
-                if (
-                    self.tiled_act_adaptive_enabled
-                    and not refresh_act_quant
-                    and applied_act_quant_info is not None
-                ):
-                    tile_bit = int(applied_act_quant_info[n_idx, k_idx].item())
+        if self.bias is not None:
+            bias_tiles = self.bias.view(self.num_n_tiles, self.n_tile)
+            output_tiles = output_tiles + bias_tiles.unsqueeze(0)
 
-                cache_key = (k_idx, tile_bit)
-                x_tile = quantized_input_cache.get(cache_key)
-                if x_tile is None:
-                    x_tile = self._quantize_activation_tile(
-                        x[..., k_start:k_end],
-                        bit=tile_bit,
-                    )
-                    quantized_input_cache[cache_key] = x_tile
-                psum = F.linear(
-                    x_tile,
-                    self.weight[n_start:n_end, k_start:k_end],
-                    None,
-                )
-
-                if tile_metrics is not None:
-                    tile_metrics[n_idx, k_idx] = _compute_tiled_act_metric(
-                        psum,
-                        self.tiled_act_metric,
-                    )
-                if capture_psums:
-                    per_k_tiles.append(psum.detach())
-                reduced_tile = psum if reduced_tile is None else reduced_tile + psum
-            if reduced_tile is None:
-                raise RuntimeError(
-                    f"Layer '{self.layer_name}' produced no tiled partial sums."
-                )
-            if self.bias is not None:
-                reduced_tile = reduced_tile + self.bias[n_start:n_end]
-            output_tiles.append(reduced_tile)
-            if capture_psums:
-                captured_psum_tiles.append(torch.stack(per_k_tiles, dim=0))
-
-        output = torch.cat(output_tiles, dim=-1)
+        output = self._reshape_tiled_output(output_tiles, leading_shape)
         next_act_quant_info = None
         next_act_scores = None
         if tile_metrics is not None:
@@ -700,7 +909,10 @@ class QuantLinearInference(nn.Linear):
             next_act_quant_info = self._act_quant_info.clone()
 
         if capture_psums and self._tiled_wa_profiler is not None:
-            psum_tiles = torch.stack(captured_psum_tiles, dim=0)
+            if psum_tiles is None:
+                raise RuntimeError(
+                    f"Layer '{self.layer_name}' requested PSUM capture without tiled PSUMs."
+                )
             payload = {
                 "linear_quant_mode": self.linear_quant_mode,
                 "input_shape": tuple(x.shape),
@@ -708,8 +920,8 @@ class QuantLinearInference(nn.Linear):
                 "output_shape": tuple(output.shape),
                 "k_tile": int(self.k_tile),
                 "n_tile": int(self.n_tile),
-                "num_k_tiles": len(k_tile_ranges),
-                "num_n_tiles": len(n_tile_ranges),
+                "num_k_tiles": int(self.num_k_tiles),
+                "num_n_tiles": int(self.num_n_tiles),
                 "act_bit": int(self.act_bit),
                 "weight_bit": int(getattr(self, "weight_bit", -1)),
                 "act_group_size": int(self.act_group_size),
@@ -721,9 +933,9 @@ class QuantLinearInference(nn.Linear):
                     "input_leading_dims",
                     "n_tile",
                 ],
-                "n_tile_ranges": n_tile_ranges,
-                "k_tile_ranges": k_tile_ranges,
-                "psum_tiles": psum_tiles,
+                "n_tile_ranges": self._n_tile_ranges,
+                "k_tile_ranges": self._k_tile_ranges,
+                "psum_tiles": self._reshape_captured_psum_tiles(psum_tiles, leading_shape),
             }
             if self.tiled_act_adaptive_enabled:
                 payload.update(
