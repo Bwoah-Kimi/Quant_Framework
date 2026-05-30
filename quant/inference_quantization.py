@@ -51,7 +51,7 @@ class QuantConfig:
     n_tile: int = -1
     tiled_act_adaptive_enabled: bool = False
     tiled_act_refresh_interval: int = 1
-    tiled_act_metric: str = "l1"  # "absmax", "l1", "l2", "exp_spread", "exp_concentration", or "exp_spread_nz_frac"
+    tiled_act_metric: str = "l1"  # "absmax", "l1", "l2", "exp_spread", "exp_spread_raw", or "exp_spread_nz_frac"
     tiled_act_int4_threshold: float = 0.25
 
     # Attention quant params
@@ -171,16 +171,18 @@ class QuantConfig:
                 )
             if self.tiled_act_metric not in {
                 "absmax", "l1", "l2",
-                "exp_spread", "exp_concentration", "exp_spread_nz_frac",
+                "exp_spread", "exp_spread_raw", "exp_spread_nz_frac",
             }:
                 raise ValueError(
                     "tiled_act_metric must be one of "
-                    "['absmax', 'l1', 'l2', 'exp_spread', 'exp_concentration', 'exp_spread_nz_frac']."
+                    "['absmax', 'l1', 'l2', 'exp_spread', 'exp_spread_raw', 'exp_spread_nz_frac']."
                 )
             threshold = float(self.tiled_act_int4_threshold)
-            if threshold < 0.0 or threshold > 1.0:
+            max_threshold = 255.0 if self.tiled_act_metric == "exp_spread_raw" else 1.0
+            if threshold < 0.0 or threshold > max_threshold:
                 raise ValueError(
-                    "tiled activation INT4 threshold must be in the range [0, 1]."
+                    "tiled activation INT4 threshold must be in the range "
+                    f"[0, {max_threshold:g}] for metric '{self.tiled_act_metric}'."
                 )
             if int(self.act_bit) != 8:
                 raise ValueError(
@@ -354,7 +356,6 @@ def _detach_to_cpu(value: Any) -> Any:
     return value
 
 
-_EXP_CONCENTRATION_BAND = 4
 _TILED_WA_PSUM_CHUNK_TARGET_BYTES = 64 * 1024 * 1024
 _TILED_WA_OUTPUT_CHUNK_TARGET_BYTES = 256 * 1024 * 1024
 
@@ -376,20 +377,12 @@ def _compute_tiled_act_metric(psum: torch.Tensor, metric: str) -> torch.Tensor:
         return psum_f.abs().sum()
     if metric == "l2":
         return torch.sqrt(torch.square(psum_f).sum())
-    if metric == "exp_spread":
+    if metric in {"exp_spread", "exp_spread_raw"}:
         exp, nonzero_mask = _extract_bf16_exponents(psum_f)
         if not nonzero_mask.any():
             return torch.tensor(0.0, device=psum.device)
         exp_nz = exp[nonzero_mask].float()
         return exp_nz.amax() - exp_nz.amin()
-    if metric == "exp_concentration":
-        exp, nonzero_mask = _extract_bf16_exponents(psum_f)
-        if not nonzero_mask.any():
-            return torch.tensor(0.0, device=psum.device)
-        exp_nz = exp[nonzero_mask].float()
-        max_exp = exp_nz.amax()
-        concentrated = (exp_nz >= max_exp - _EXP_CONCENTRATION_BAND).sum()
-        return 1.0 - (concentrated.float() / exp_nz.numel())
     if metric == "exp_spread_nz_frac":
         exp, nonzero_mask = _extract_bf16_exponents(psum_f)
         nz_count = nonzero_mask.sum()
@@ -407,13 +400,19 @@ def _derive_tiled_act_quant_info(
     *,
     baseline_bit: int,
     int4_threshold: float,
+    normalize_scores: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tile_metrics = tile_metrics.float()
-    ref = tile_metrics.amax()
-    if float(ref.item()) <= 0.0:
-        scores = torch.zeros_like(tile_metrics, dtype=torch.float32)
+    if normalize_scores:
+        ref = tile_metrics.amax()
+        if float(ref.item()) <= 0.0:
+            scores = torch.zeros_like(tile_metrics, dtype=torch.float32)
+        else:
+            scores = (tile_metrics / ref).clamp(0.0, 1.0)
+        int4_mask = scores < float(int4_threshold)
     else:
-        scores = (tile_metrics / ref).clamp(0.0, 1.0)
+        scores = tile_metrics
+        int4_mask = scores <= float(int4_threshold)
 
     act_quant_info = torch.full(
         tile_metrics.shape,
@@ -422,7 +421,7 @@ def _derive_tiled_act_quant_info(
         device=tile_metrics.device,
     )
     act_quant_info = torch.where(
-        scores < float(int4_threshold),
+        int4_mask,
         torch.full_like(act_quant_info, 4),
         act_quant_info,
     )
@@ -453,17 +452,10 @@ def _compute_tiled_act_metrics(
     max_exp = exp_f.masked_fill(~nonzero_mask, float("-inf")).amax(dim=-1)
     zeros = torch.zeros_like(max_exp)
 
-    if metric == "exp_spread":
+    if metric in {"exp_spread", "exp_spread_raw"}:
         min_exp = exp_f.masked_fill(~nonzero_mask, float("inf")).amin(dim=-1)
         spread = max_exp - min_exp
         return torch.where(has_nonzero, spread, zeros)
-    if metric == "exp_concentration":
-        nz_count = nonzero_mask.sum(dim=-1)
-        concentrated = (
-            (exp_f >= (max_exp.unsqueeze(-1) - _EXP_CONCENTRATION_BAND)) & nonzero_mask
-        ).sum(dim=-1)
-        score = 1.0 - (concentrated.float() / nz_count.clamp_min(1).float())
-        return torch.where(has_nonzero, score, zeros)
     if metric == "exp_spread_nz_frac":
         min_exp = exp_f.masked_fill(~nonzero_mask, float("inf")).amin(dim=-1)
         spread = max_exp - min_exp
@@ -902,6 +894,7 @@ class QuantLinearInference(nn.Linear):
                 tile_metrics,
                 baseline_bit=int(self.act_bit),
                 int4_threshold=self.tiled_act_int4_threshold,
+                normalize_scores=(self.tiled_act_metric != "exp_spread_raw"),
             )
             self._act_quant_info = next_act_quant_info.detach().cpu()
             self._last_act_scores = next_act_scores.detach().cpu()
