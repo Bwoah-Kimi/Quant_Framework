@@ -471,6 +471,8 @@ class TiledWAProfiler:
         target_steps: Optional[List[int]] = None,
         target_modules: Optional[List[str]] = None,
         target_layer_indices: Optional[List[int]] = None,
+        capture_psums: bool = True,
+        capture_bit_tensors: bool = True,
     ):
         self.save_dir = save_dir
         self.target_steps = set(target_steps) if target_steps is not None else None
@@ -479,6 +481,8 @@ class TiledWAProfiler:
             set(target_layer_indices) if target_layer_indices is not None else None
         )
         self.current_step = 0
+        self.capture_psums = bool(capture_psums)
+        self.capture_bit_tensors = bool(capture_bit_tensors)
         self.buffer: Dict[str, List[Dict[str, Any]]] = {}
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -619,6 +623,13 @@ class QuantLinearInference(nn.Linear):
         self._tiled_forward_step = 0
         self._act_quant_info: Optional[torch.Tensor] = None
         self._last_act_scores: Optional[torch.Tensor] = None
+        self._act_quant_counts: Optional[Dict[int, int]] = None
+
+    def reset_tiled_act_adaptive_state(self) -> None:
+        self._tiled_forward_step = 0
+        self._act_quant_info = None
+        self._last_act_scores = None
+        self._act_quant_counts = None
 
     def set_tiled_wa_profiler(
         self, profiler: Optional[TiledWAProfiler]
@@ -839,10 +850,11 @@ class QuantLinearInference(nn.Linear):
         return output_tiles, psum_tiles
 
     def _forward_tiled_wa(self, x: torch.Tensor) -> torch.Tensor:
-        capture_psums = (
+        profile_enabled = (
             self._tiled_wa_profiler is not None
             and self._tiled_wa_profiler.should_capture(self.layer_name)
         )
+        capture_psums = bool(profile_enabled and self._tiled_wa_profiler.capture_psums)
         refresh_act_quant = self._should_refresh_tiled_act_quant()
         forward_step_idx = self._tiled_forward_step
         leading_shape, x_tiles = self._reshape_tiled_input(x)
@@ -898,14 +910,23 @@ class QuantLinearInference(nn.Linear):
             )
             self._act_quant_info = next_act_quant_info.detach().cpu()
             self._last_act_scores = next_act_scores.detach().cpu()
+            self._act_quant_counts = {
+                4: int(torch.count_nonzero(next_act_quant_info == 4).item()),
+                int(self.act_bit): int(torch.count_nonzero(next_act_quant_info == int(self.act_bit)).item()),
+            }
         elif self.tiled_act_adaptive_enabled and self._act_quant_info is not None:
             next_act_quant_info = self._act_quant_info.clone()
 
-        if capture_psums and self._tiled_wa_profiler is not None:
-            if psum_tiles is None:
+        if profile_enabled and self._tiled_wa_profiler is not None:
+            if capture_psums and psum_tiles is None:
                 raise RuntimeError(
                     f"Layer '{self.layer_name}' requested PSUM capture without tiled PSUMs."
                 )
+            total_tiles = int(self.num_n_tiles * self.num_k_tiles)
+            if self.tiled_act_adaptive_enabled and not refresh_act_quant and self._act_quant_counts is not None:
+                applied_bit_counts = dict(self._act_quant_counts)
+            else:
+                applied_bit_counts = {int(self.act_bit): total_tiles}
             payload = {
                 "linear_quant_mode": self.linear_quant_mode,
                 "input_shape": tuple(x.shape),
@@ -920,6 +941,7 @@ class QuantLinearInference(nn.Linear):
                 "act_group_size": int(self.act_group_size),
                 "w_group_size": int(self.k_tile),
                 "forward_step_idx": int(forward_step_idx),
+                "act_bit_counts": applied_bit_counts,
                 "psum_tile_layout": [
                     "n_tile_index",
                     "k_tile_index",
@@ -928,8 +950,9 @@ class QuantLinearInference(nn.Linear):
                 ],
                 "n_tile_ranges": self._n_tile_ranges,
                 "k_tile_ranges": self._k_tile_ranges,
-                "psum_tiles": self._reshape_captured_psum_tiles(psum_tiles, leading_shape),
             }
+            if capture_psums:
+                payload["psum_tiles"] = self._reshape_captured_psum_tiles(psum_tiles, leading_shape)
             if self.tiled_act_adaptive_enabled:
                 payload.update(
                     {
@@ -937,11 +960,16 @@ class QuantLinearInference(nn.Linear):
                         "adaptive_act_metric": self.tiled_act_metric,
                         "adaptive_act_refresh_interval": int(self.tiled_act_refresh_interval),
                         "adaptive_act_refresh_step": bool(refresh_act_quant),
-                        "adaptive_act_applied_bits": applied_act_quant_info,
-                        "adaptive_act_next_bits": next_act_quant_info,
-                        "adaptive_act_scores": next_act_scores if refresh_act_quant else None,
                     }
                 )
+                if self._tiled_wa_profiler.capture_bit_tensors:
+                    payload.update(
+                        {
+                            "adaptive_act_applied_bits": applied_act_quant_info,
+                            "adaptive_act_next_bits": next_act_quant_info,
+                            "adaptive_act_scores": next_act_scores if refresh_act_quant else None,
+                        }
+                    )
             self._tiled_wa_profiler.record(self.layer_name, payload)
         self._tiled_forward_step += 1
         return output
@@ -1026,11 +1054,23 @@ def detach_tiled_wa_profiler(model: nn.Module) -> int:
     return attach_tiled_wa_profiler(model, None)
 
 
+def reset_tiled_wa_adaptive_state(model: nn.Module) -> int:
+    reset_modules = 0
+    for module in model.modules():
+        if not isinstance(module, QuantLinearInference):
+            continue
+        if module.linear_quant_mode != "tiled_wa":
+            continue
+        module.reset_tiled_act_adaptive_state()
+        reset_modules += 1
+    return reset_modules
+
 __all__ = [
     "QuantConfig",
     "QuantLinearInference",
     "TiledWAProfiler",
     "attach_tiled_wa_profiler",
     "detach_tiled_wa_profiler",
+    "reset_tiled_wa_adaptive_state",
     "quantize_weight_tensor",
 ]
